@@ -222,6 +222,162 @@ def add_per_word_target_stats(
     return train.drop(columns=["tok_lc"]), test.drop(columns=["tok_lc"])
 
 
+def add_genre_features(
+    train: pd.DataFrame, test: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Genre = text-name prefix (lit, popsci, arg, ins, enc).
+    genre_enc: leave-text-out genre mean TRT on train; full-train genre mean on test.
+    genre_id:  integer label (stable across train/test via sorted enumeration)."""
+    train = train.copy()
+    test  = test.copy()
+
+    train["_genre"] = train["text"].str.extract(r"^([a-z]+)_", expand=False)
+    test["_genre"]  = test["text"].str.extract(r"^([a-z]+)_", expand=False)
+
+    all_genres = sorted(set(train["_genre"].dropna()) | set(test["_genre"].dropna()))
+    genre2id   = {g: i for i, g in enumerate(all_genres)}
+    train["genre_id"] = train["_genre"].map(genre2id).fillna(-1).astype(int)
+    test["genre_id"]  = test["_genre"].map(genre2id).fillna(-1).astype(int)
+
+    global_mean  = float(train["answer"].mean())
+    genre_means  = train.groupby("_genre")["answer"].mean()
+
+    # Test: full-train genre mean (unseen texts fall back to global mean).
+    test["genre_enc"] = test["_genre"].map(genre_means).fillna(global_mean)
+
+    # Train: leave-text-out — use the mean of all *other* texts in the same genre
+    # to avoid leakage (mirrors the leave-text-out logic in add_per_word_target_stats).
+    train["genre_enc"] = np.nan
+    for text in train["text"].unique():
+        genre = train.loc[train["text"] == text, "_genre"].iloc[0]
+        mask_other = (train["_genre"] == genre) & (train["text"] != text)
+        other_mean = train.loc[mask_other, "answer"].mean()
+        train.loc[train["text"] == text, "genre_enc"] = (
+            other_mean if pd.notna(other_mean) else global_mean
+        )
+    train["genre_enc"] = train["genre_enc"].fillna(global_mean)
+
+    return train.drop(columns=["_genre"]), test.drop(columns=["_genre"])
+
+
+# ---------------------------------------------------------------------------
+# Participant Mixup augmentation
+# ---------------------------------------------------------------------------
+
+def augment_participant_mixup(
+    train: pd.DataFrame,
+    multiplier: float = 1.0,
+    add_average_reader: bool = True,
+    seed: int = SEED,
+) -> pd.DataFrame:
+    """Augment training data by interpolating between pairs of participants
+    that read the same word (same text + page_num + word_idx).
+
+    For each word position the group of ~30 participant rows shares identical
+    word-level features; only answer, participant_enc, doc_num (and surprisal
+    when present) differ between readers.  Mixing those columns between two
+    real readers creates a plausible synthetic reader.
+
+    add_average_reader: also appends one row per word position whose
+    interpolatable columns are the group mean.  This gives the model an
+    explicit 'prototypical reader' training example — useful because all test
+    participants are unseen and their participant_enc falls back to the global
+    mean.  The signal partially overlaps with tok_mean but pairs the mean TRT
+    with the correct global participant_enc value, which tok_mean does not.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Columns that differ between participants for the same word position.
+    # Everything else (word_len, freq, position, genre_enc …) is identical
+    # across all participants reading the same word, so we keep it from the
+    # anchor row unchanged.
+    interp_cols = [c for c in ("answer", "participant_enc", "doc_num", "surprisal")
+                   if c in train.columns]
+
+    synth_parts: list[pd.DataFrame] = []
+    avg_parts:   list[pd.DataFrame] = []
+
+    for _, grp in train.groupby(["text", "page_num", "word_idx"], sort=False):
+        n = len(grp)
+        if n < 2:
+            continue
+
+        vals = grp[interp_cols].to_numpy(dtype=float)   # (n_participants, n_interp)
+        n_pairs = round(n * multiplier)
+
+        # Sample random pairs; ensure no self-pairs.
+        idx_a = rng.integers(0, n, n_pairs)
+        idx_b = rng.integers(0, n, n_pairs)
+        idx_b[idx_a == idx_b] = (idx_b[idx_a == idx_b] + 1) % n
+
+        alpha = rng.uniform(0.0, 1.0, (n_pairs, 1))
+        synth_vals = alpha * vals[idx_a] + (1.0 - alpha) * vals[idx_b]
+
+        # Use anchor rows as templates (word-level features are identical across
+        # the group, so any row works; using idx_a preserves integer dtypes etc.)
+        synth_rows = grp.iloc[idx_a].reset_index(drop=True).copy()
+        for i, col in enumerate(interp_cols):
+            synth_rows[col] = synth_vals[:, i]
+        synth_parts.append(synth_rows)
+
+        if add_average_reader:
+            avg_row = grp.iloc[[0]].copy()
+            for i, col in enumerate(interp_cols):
+                avg_row[col] = float(vals[:, i].mean())
+            avg_parts.append(avg_row)
+
+    pieces = [train]
+    if synth_parts:
+        pieces.append(pd.concat(synth_parts, ignore_index=True))
+    if avg_parts:
+        pieces.append(pd.concat(avg_parts, ignore_index=True))
+
+    augmented = pd.concat(pieces, ignore_index=True)
+    n_added = len(augmented) - len(train)
+    avg_added = sum(len(p) for p in avg_parts)
+    print(f"[aug] mixup: added {n_added:,} synthetic rows "
+          f"({n_added - avg_added:,} mixup + {avg_added:,} average-reader)")
+    return augmented
+
+
+def augment_genre_average_reader(train: pd.DataFrame) -> pd.DataFrame:
+    """Add one synthetic 'average reader for this genre' row per unique
+    (genre, word-surface-form) pair.
+
+    Rationale: all test texts are unseen but their genres are known (lit, arg,
+    ins).  A word that appears in multiple training texts of the same genre
+    accumulates a genre-specific mean TRT that is more informative than the
+    global average.  These rows teach the model: 'when participant_enc is at
+    the global mean and you are reading this word in this genre context, expect
+    this TRT.'  This is complementary to the per-word-position average reader
+    inside augment_participant_mixup, which averages across participants for
+    one specific text occurrence; here we average across both participants AND
+    texts within a genre.
+    """
+    train = train.copy()
+    train["_genre"] = train["text"].str.extract(r"^([a-z]+)_", expand=False)
+    train["_tok_lc"] = train["word"].astype(str).str.lower().str.strip()
+
+    has_part_enc = "participant_enc" in train.columns
+    global_participant_enc = float(train["participant_enc"].mean()) if has_part_enc else None
+
+    avg_rows: list[pd.DataFrame] = []
+    for (genre, tok), grp in train.groupby(["_genre", "_tok_lc"], sort=False):
+        if len(grp) < 2:
+            continue
+        avg_row = grp.iloc[[0]].copy()
+        avg_row["answer"] = float(grp["answer"].mean())
+        if has_part_enc:
+            avg_row["participant_enc"] = global_participant_enc
+        avg_rows.append(avg_row)
+
+    augmented = pd.concat([train] + avg_rows, ignore_index=True)
+    augmented = augmented.drop(columns=["_genre", "_tok_lc"])
+    n_added = len(augmented) - len(train)
+    print(f"[aug] genre-avg-reader: added {n_added:,} rows")
+    return augmented
+
+
 # ---------------------------------------------------------------------------
 # Surprisal from a Romanian causal LM
 # ---------------------------------------------------------------------------
@@ -386,6 +542,7 @@ FEATURE_COLS = [
     "prev_is_punct", "prev_has_digit",
     "next_word_len", "next_alpha_len", "next_n_syllables",
     "next_is_punct", "next_has_digit",
+    "genre_id", "genre_enc",
 ]
 
 
@@ -427,6 +584,7 @@ def main() -> None:
     test = add_context_features(test)
     train, test = add_corpus_frequency(train, test)
     train, test = add_per_word_target_stats(train, test)
+    train, test = add_genre_features(train, test)
 
     feature_cols = list(FEATURE_COLS)
     if USE_LM:
@@ -446,6 +604,9 @@ def main() -> None:
                 pass
     else:
         print("[lm] skipped (USE_LM=0)")
+
+    train = augment_participant_mixup(train)
+    train = augment_genre_average_reader(train)
 
     # Sanity: feature columns must all be present and non-NaN.
     for c in feature_cols:
