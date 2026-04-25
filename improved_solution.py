@@ -53,6 +53,7 @@ USE_LM = os.environ.get("USE_LM", "1") == "1"
 USE_BERT = os.environ.get("USE_BERT", "1") == "1"
 USE_TWO_STAGE = os.environ.get("USE_TWO_STAGE", "1") == "1"
 USE_ROLLING   = os.environ.get("USE_ROLLING",   "1") == "1"
+USE_META      = os.environ.get("USE_META",      "1") == "1"
 ROLLING_WINDOWS = [int(x) for x in os.environ.get("ROLLING_WINDOWS", "10,20,50").split(",")]
 ROLLING_SKIP_THRESHOLD = float(os.environ.get("ROLLING_SKIP_THRESHOLD", "50.0"))
 
@@ -1036,6 +1037,8 @@ def main() -> None:
     test_blend = w * test_a + (1 - w) * test_b
     print(f"[blend] global OOF (raw)= {comp_metric(y, oof_blend):.3f}")
 
+    oof_c = None; test_c = None   # populated only when USE_ROLLING
+
     # ---------- Pass-2: rolling session features ----------
     if USE_ROLLING:
         train_orig = train[orig_mask].copy().reset_index(drop=True)
@@ -1089,14 +1092,35 @@ def main() -> None:
     else:
         a, b = fit_calibration(y, oof_blend)
 
+    # ---------- Stacked meta-model ----------
+    if USE_META:
+        from sklearn.linear_model import RidgeCV
+        y_orig    = y[orig_mask]
+        oof_cols  = [oof_a[orig_mask], oof_b[orig_mask]]
+        test_cols = [test_a, test_b]
+        if oof_c is not None:
+            oof_cols.append(oof_c)
+            test_cols.append(test_c)
+        oof_stack  = np.column_stack(oof_cols)
+        test_stack = np.column_stack(test_cols)
+        meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0]).fit(oof_stack, y_orig)
+        oof_meta  = meta.predict(oof_stack)
+        test_meta = meta.predict(test_stack)
+        print(f"[meta] {len(oof_cols)} models  "
+              f"coefs={np.round(meta.coef_, 3)}  alpha={meta.alpha_:.2f}")
+        print(f"[meta] OOF={comp_metric(y_orig, oof_meta):.3f}")
+        a, b       = fit_calibration(y_orig, oof_meta)
+        test_blend = test_meta
+
     print(f"[calib] a={a:.4f} b={b:.4f}")
     test_cal = np.clip(a * test_blend + b, 0, None)
-    if USE_ROLLING:
-        print(f"[final] global OOF (calibrated)= "
-              f"{comp_metric(y2, np.clip(a * oof_final + b, 0, None)):.3f}")
+    if USE_META:
+        oof_cal_score = comp_metric(y[orig_mask], np.clip(a * oof_meta + b, 0, None))
+    elif USE_ROLLING:
+        oof_cal_score = comp_metric(y2, np.clip(a * oof_final + b, 0, None))
     else:
-        print(f"[final] global OOF (calibrated)= "
-              f"{comp_metric(y, np.clip(a * oof_blend + b, 0, None)):.3f}")
+        oof_cal_score = comp_metric(y, np.clip(a * oof_blend + b, 0, None))
+    print(f"[final] global OOF (calibrated)= {oof_cal_score:.3f}")
 
     print(f"[pred] test stats: min={test_cal.min():.1f} mean={test_cal.mean():.1f} "
           f"max={test_cal.max():.1f} std={test_cal.std():.1f} "
