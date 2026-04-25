@@ -52,6 +52,9 @@ import lightgbm as lgb
 USE_LM = os.environ.get("USE_LM", "1") == "1"
 USE_BERT = os.environ.get("USE_BERT", "1") == "1"
 USE_TWO_STAGE = os.environ.get("USE_TWO_STAGE", "1") == "1"
+USE_ROLLING   = os.environ.get("USE_ROLLING",   "1") == "1"
+ROLLING_WINDOWS = [int(x) for x in os.environ.get("ROLLING_WINDOWS", "10,20,50").split(",")]
+ROLLING_SKIP_THRESHOLD = float(os.environ.get("ROLLING_SKIP_THRESHOLD", "50.0"))
 
 LM_CANDIDATES = os.environ.get(
     "LM_CANDIDATES",
@@ -93,7 +96,7 @@ else:
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[cfg] INPUT_DIR={INPUT_DIR}  OUTPUT_DIR={OUTPUT_DIR}")
 print(f"[cfg] USE_LM={USE_LM}  USE_BERT={USE_BERT}  USE_TWO_STAGE={USE_TWO_STAGE}  "
-      f"N_SEEDS={N_SEEDS}")
+      f"USE_ROLLING={USE_ROLLING}  N_SEEDS={N_SEEDS}")
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +268,127 @@ def add_per_word_target_stats(
     train["tok_count"] = train["tok_count"].fillna(0).astype(float)
     test["tok_count"] = test["tok_count"].fillna(0).astype(float)
     return train.drop(columns=["tok_lc"]), test.drop(columns=["tok_lc"])
+
+
+# ---------------------------------------------------------------------------
+# Genre features
+# ---------------------------------------------------------------------------
+
+def add_genre_features(
+    train: pd.DataFrame, test: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Genre = text-name prefix (lit, popsci, arg, ins, enc).
+    genre_enc: leave-text-out genre mean TRT on train; full-train genre mean on test.
+    genre_id:  integer label (stable across train/test via sorted enumeration)."""
+    train = train.copy()
+    test  = test.copy()
+
+    train["_genre"] = train["text"].str.extract(r"^([a-z]+)_", expand=False)
+    test["_genre"]  = test["text"].str.extract(r"^([a-z]+)_", expand=False)
+
+    all_genres = sorted(set(train["_genre"].dropna()) | set(test["_genre"].dropna()))
+    genre2id   = {g: i for i, g in enumerate(all_genres)}
+    train["genre_id"] = train["_genre"].map(genre2id).fillna(-1).astype(int)
+    test["genre_id"]  = test["_genre"].map(genre2id).fillna(-1).astype(int)
+
+    global_mean = float(train["answer"].mean())
+    genre_means = train.groupby("_genre")["answer"].mean()
+
+    test["genre_enc"] = test["_genre"].map(genre_means).fillna(global_mean)
+
+    train["genre_enc"] = np.nan
+    for text in train["text"].unique():
+        genre = train.loc[train["text"] == text, "_genre"].iloc[0]
+        mask_other = (train["_genre"] == genre) & (train["text"] != text)
+        other_mean = train.loc[mask_other, "answer"].mean()
+        train.loc[train["text"] == text, "genre_enc"] = (
+            other_mean if pd.notna(other_mean) else global_mean
+        )
+    train["genre_enc"] = train["genre_enc"].fillna(global_mean)
+
+    return train.drop(columns=["_genre"]), test.drop(columns=["_genre"])
+
+
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+
+def augment_participant_mixup(
+    train: pd.DataFrame,
+    multiplier: float = 1.0,
+    add_average_reader: bool = True,
+    seed: int = SEED,
+) -> pd.DataFrame:
+    """Interpolate between pairs of participants reading the same word position.
+    add_average_reader appends one per-word-position mean row as a prototypical
+    reader — matching the unseen-participant scenario at test time."""
+    rng = np.random.default_rng(seed)
+    interp_cols = [c for c in ("answer", "participant_enc", "doc_num", "surprisal")
+                   if c in train.columns]
+
+    synth_parts: list[pd.DataFrame] = []
+    avg_parts:   list[pd.DataFrame] = []
+
+    for _, grp in train.groupby(["text", "page_num", "word_idx"], sort=False):
+        n = len(grp)
+        if n < 2:
+            continue
+        vals = grp[interp_cols].to_numpy(dtype=float)
+        n_pairs = round(n * multiplier)
+        idx_a = rng.integers(0, n, n_pairs)
+        idx_b = rng.integers(0, n, n_pairs)
+        idx_b[idx_a == idx_b] = (idx_b[idx_a == idx_b] + 1) % n
+        alpha = rng.uniform(0.0, 1.0, (n_pairs, 1))
+        synth_vals = alpha * vals[idx_a] + (1.0 - alpha) * vals[idx_b]
+        synth_rows = grp.iloc[idx_a].reset_index(drop=True).copy()
+        for i, col in enumerate(interp_cols):
+            synth_rows[col] = synth_vals[:, i]
+        synth_parts.append(synth_rows)
+        if add_average_reader:
+            avg_row = grp.iloc[[0]].copy()
+            for i, col in enumerate(interp_cols):
+                avg_row[col] = float(vals[:, i].mean())
+            avg_parts.append(avg_row)
+
+    pieces = [train]
+    if synth_parts:
+        pieces.append(pd.concat(synth_parts, ignore_index=True))
+    if avg_parts:
+        pieces.append(pd.concat(avg_parts, ignore_index=True))
+    augmented = pd.concat(pieces, ignore_index=True)
+    n_added = len(augmented) - len(train)
+    avg_added = sum(len(p) for p in avg_parts)
+    print(f"[aug] mixup: added {n_added:,} synthetic rows "
+          f"({n_added - avg_added:,} mixup + {avg_added:,} average-reader)")
+    return augmented
+
+
+def augment_genre_average_reader(train: pd.DataFrame) -> pd.DataFrame:
+    """One synthetic row per (genre, word-form) pair: mean TRT across all
+    participants and texts in that genre. Gives the model an explicit example
+    for the unseen-text/unseen-participant scenario at test time."""
+    train = train.copy()
+    train["_genre"] = train["text"].str.extract(r"^([a-z]+)_", expand=False)
+    train["_tok_lc"] = train["word"].astype(str).str.lower().str.strip()
+
+    has_part_enc = "participant_enc" in train.columns
+    global_participant_enc = float(train["participant_enc"].mean()) if has_part_enc else None
+
+    avg_rows: list[pd.DataFrame] = []
+    for (genre, tok), grp in train.groupby(["_genre", "_tok_lc"], sort=False):
+        if len(grp) < 2:
+            continue
+        avg_row = grp.iloc[[0]].copy()
+        avg_row["answer"] = float(grp["answer"].mean())
+        if has_part_enc:
+            avg_row["participant_enc"] = global_participant_enc
+        avg_rows.append(avg_row)
+
+    augmented = pd.concat([train] + avg_rows, ignore_index=True)
+    augmented = augmented.drop(columns=["_genre", "_tok_lc"])
+    n_added = len(augmented) - len(train)
+    print(f"[aug] genre-avg-reader: added {n_added:,} rows")
+    return augmented
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +683,62 @@ def compute_bert_features(df: pd.DataFrame, tokenizer, model, mask_token_id: int
 
 
 # ---------------------------------------------------------------------------
+# Rolling session features (pass-2 input)
+# ---------------------------------------------------------------------------
+
+def compute_rolling_features(
+    df: pd.DataFrame,
+    pred: np.ndarray,
+    windows: List[int] = ROLLING_WINDOWS,
+    skip_threshold: float = ROLLING_SKIP_THRESHOLD,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Derive per-participant rolling statistics from pass-1 predictions.
+
+    For each word at session position i, the rolling window covers the
+    k predictions BEFORE it (shift(1) removes the current word so there
+    is no look-ahead leakage).  Three feature groups are produced:
+
+      session_word_idx   – absolute position in the participant's reading
+                           session, capturing fatigue / warm-up effects.
+      pass1_pred         – the raw pass-1 prediction for this word.
+      roll_mean_{k}      – rolling mean TRT over the last k words; tracks
+                           the participant's current reading pace.
+      roll_skip_{k}      – rolling fraction of words predicted below
+                           skip_threshold; tracks current skimming tendency.
+
+    The function sorts internally into reading order, computes features,
+    then restores the original row order before returning.
+    """
+    df = df.copy()
+    df["__pred"] = pred
+    df["__pos"]  = np.arange(len(df))
+
+    df_s = df.sort_values(["participant_id", "doc_num", "page_num", "word_idx"])
+    df_s["session_word_idx"] = df_s.groupby("participant_id").cumcount()
+    df_s["pass1_pred"]       = df_s["__pred"]
+
+    new_cols = ["session_word_idx", "pass1_pred"]
+    global_mean = float(pred.mean())
+
+    for k in windows:
+        grp = df_s.groupby("participant_id")["__pred"]
+        df_s[f"roll_mean_{k}"] = (
+            grp.transform(lambda s: s.shift(1).rolling(k, min_periods=1).mean())
+            .fillna(global_mean)
+        )
+        df_s[f"roll_skip_{k}"] = (
+            grp.transform(
+                lambda s: (s.shift(1) < skip_threshold).astype(float)
+                          .rolling(k, min_periods=1).mean()
+            ).fillna(0.3)
+        )
+        new_cols += [f"roll_mean_{k}", f"roll_skip_{k}"]
+
+    df_s = df_s.sort_values("__pos").drop(columns=["__pred", "__pos"])
+    return df_s, new_cols
+
+
+# ---------------------------------------------------------------------------
 # Modeling
 # ---------------------------------------------------------------------------
 
@@ -622,6 +802,7 @@ def main() -> None:
     train, test = add_corpus_frequency(train, test)
     train, test, has_zipf = add_wordfreq_features(train, test)
     train, test = add_per_word_target_stats(train, test)
+    train, test = add_genre_features(train, test)
 
     feature_cols = [
         "word_len", "alpha_len", "n_syllables",
@@ -635,6 +816,7 @@ def main() -> None:
         "prev_is_punct", "prev_has_digit",
         "next_word_len", "next_alpha_len", "next_n_syllables",
         "next_is_punct", "next_has_digit",
+        "genre_id", "genre_enc",
     ]
     if has_zipf:
         feature_cols += ["zipf_freq", "prev_zipf_freq", "next_zipf_freq"]
@@ -741,6 +923,11 @@ def main() -> None:
     else:
         print("[bert] disabled (USE_BERT=0)")
 
+    train["_is_orig"] = True          # mark original rows before synthetic rows are appended
+    train = augment_participant_mixup(train)
+    train = augment_genre_average_reader(train)
+    train["_is_orig"] = train["_is_orig"].fillna(False)
+
     for c in feature_cols:
         assert c in train.columns and c in test.columns, f"missing feature: {c}"
     n_nan_tr = int(train[feature_cols].isna().sum().sum())
@@ -754,6 +941,7 @@ def main() -> None:
     train = train.sort_values(
         ["text", "participant_id", "doc_num", "page_num", "word_idx"]
     ).reset_index(drop=True)
+    orig_mask = train["_is_orig"].values.astype(bool)   # aligned to sorted train
 
     X = train[feature_cols].values
     y = train["answer"].values.astype(float)
@@ -848,11 +1036,67 @@ def main() -> None:
     test_blend = w * test_a + (1 - w) * test_b
     print(f"[blend] global OOF (raw)= {comp_metric(y, oof_blend):.3f}")
 
-    a, b = fit_calibration(y, oof_blend)
+    # ---------- Pass-2: rolling session features ----------
+    if USE_ROLLING:
+        train_orig = train[orig_mask].copy().reset_index(drop=True)
+        oof_orig   = oof_blend[orig_mask]
+
+        train_orig, roll_cols = compute_rolling_features(train_orig, oof_orig)
+        test,       _         = compute_rolling_features(test, test_blend)
+
+        p2_fcols = feature_cols + roll_cols
+        X2   = train_orig[p2_fcols].values
+        y2   = train_orig["answer"].values.astype(float)
+        g2   = train_orig["text"].values
+        Xt2  = test[p2_fcols].values
+
+        n_splits2 = min(N_FOLDS, len(np.unique(g2)))
+        gkf2 = GroupKFold(n_splits=n_splits2)
+        oof_c  = np.zeros(len(train_orig))
+        test_c = np.zeros(len(test))
+        fold_scores_c = []
+
+        for fi, (tr2, va2) in enumerate(gkf2.split(X2, y2, g2)):
+            s_oof = np.zeros(len(va2)); s_test = np.zeros(len(test))
+            for si in range(N_SEEDS):
+                seed = SEED + 3000 + 1000 * si + fi
+                dtr2 = lgb.Dataset(X2[tr2], y2[tr2])
+                dva2 = lgb.Dataset(X2[va2], y2[va2], reference=dtr2)
+                b2 = lgb.train(
+                    lgb_params_reg(seed), dtr2, num_boost_round=4000,
+                    valid_sets=[dva2],
+                    callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+                )
+                s_oof  += b2.predict(X2[va2], num_iteration=b2.best_iteration)
+                s_test += b2.predict(Xt2,     num_iteration=b2.best_iteration)
+            s_oof /= N_SEEDS; s_test /= N_SEEDS
+            oof_c[va2]  = s_oof
+            test_c     += s_test / n_splits2
+            sc = comp_metric(y2[va2], s_oof)
+            fold_scores_c.append(sc)
+            print(f"[pass2 fold {fi}] held-out={sorted(set(g2[va2]))}  score={sc:.3f}")
+        print(f"[pass2] folds mean={np.mean(fold_scores_c):.3f}  "
+              f"std={np.std(fold_scores_c):.3f}")
+        print(f"[pass2] global OOF (raw)= {comp_metric(y2, oof_c):.3f}")
+
+        w2 = optimize_blend(y2, oof_orig, oof_c)
+        print(f"[pass2 blend] w_pass1={w2:.3f}  w_pass2={1-w2:.3f}")
+        oof_final  = w2 * oof_orig  + (1 - w2) * oof_c
+        test_blend = w2 * test_blend + (1 - w2) * test_c
+        print(f"[pass2 blend] global OOF= {comp_metric(y2, oof_final):.3f}")
+        # recalibrate on original rows only (same population as test)
+        a, b = fit_calibration(y2, oof_final)
+    else:
+        a, b = fit_calibration(y, oof_blend)
+
     print(f"[calib] a={a:.4f} b={b:.4f}")
-    oof_cal = np.clip(a * oof_blend + b, 0, None)
     test_cal = np.clip(a * test_blend + b, 0, None)
-    print(f"[final] global OOF (calibrated)= {comp_metric(y, oof_cal):.3f}")
+    if USE_ROLLING:
+        print(f"[final] global OOF (calibrated)= "
+              f"{comp_metric(y2, np.clip(a * oof_final + b, 0, None)):.3f}")
+    else:
+        print(f"[final] global OOF (calibrated)= "
+              f"{comp_metric(y, np.clip(a * oof_blend + b, 0, None)):.3f}")
 
     print(f"[pred] test stats: min={test_cal.min():.1f} mean={test_cal.mean():.1f} "
           f"max={test_cal.max():.1f} std={test_cal.std():.1f} "
